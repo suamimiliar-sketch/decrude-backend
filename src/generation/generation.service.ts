@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { SupabaseService } from '../supabase/supabase.service';
 import { CloudinaryService } from '../cloudinary/cloudinary.service';
+// FIX 1: Correct import for sharp
 import sharp from 'sharp';
 
 @Injectable()
@@ -20,6 +21,16 @@ export class GenerationService {
     this.genAI = new GoogleGenerativeAI(apiKey);
   }
 
+  // HELPER: Fix Cloudinary URL for Indonesia
+  private getIndonesianUrl(url: string): string {
+    const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+    if (url.includes('res.cloudinary.com')) return url;
+    return url.replace(
+      'res.cloudinary.com',
+      `${cloudName}-res.cloudinary.com`
+    );
+  }
+
   async generateChristmasPhoto(orderId: string, themeId: string) {
     const order = await this.supabaseService.getOrderById(orderId);
 
@@ -29,38 +40,78 @@ export class GenerationService {
 
     const theme = await this.supabaseService.getThemeById(themeId);
 
+    // ANALYZE: Model Selection Strategy
+    const isFamilyPhoto = order.uploaded_photos.length === 1;
+
+    // STRATEGY: 
+    // 1 Photo (Family) -> Gemini 3 Pro (Best for preserving composition)
+    // Multiple Photos (Faces) -> Gemini 2.5 Flash (Efficient composition)
+    const modelName = isFamilyPhoto 
+      ? 'gemini-3-pro-image-preview' 
+      : 'gemini-2.5-flash-image';
+
     const generationRecord = await this.supabaseService.saveGeneratedPhoto({
       order_id: orderId,
       theme_id: themeId,
       status: 'generating',
       generation_started_at: new Date().toISOString(),
+      model_used: modelName
     });
 
     try {
-      // Download photos as base64
+      // 1. Prepare Inputs
       const photoInputs = await Promise.all(
         order.uploaded_photos.map(async (photo: any) => {
-          const imageBase64 = await this.cloudinaryService.downloadAsBase64(
+          const buffer = await this.cloudinaryService.downloadAsBuffer(
             photo.cloudinary_url,
           );
           return {
             inlineData: {
-              data: imageBase64,
+              data: buffer.toString('base64'),
               mimeType: 'image/jpeg',
             },
           };
         }),
       );
 
-      // Generate with Gemini
-      const model = this.genAI.getGenerativeModel({
-        model: 'gemini-2.5-flash-image',
-      });
+      // 2. Prompt Engineering based on Input Type
+      let promptText = "";
+      if (isFamilyPhoto) {
+        promptText = `
+          Transform this family photo into a ${theme.name_en} setting.
+          CRITICAL: Keep the EXACT faces, body shapes, and relative heights of the people. 
+          Only change the background to: ${theme.prompt}. 
+          Change clothing to: Matching Indonesian Batik Christmas attire.
+          Maintain high fidelity 8k photorealism.
+        `;
+      } else {
+        promptText = `
+          Create a group family photo using these faces.
+          Setting: ${theme.prompt}.
+          People: Compose these ${photoInputs.length} people together naturally.
+          Clothing: Matching Indonesian Batik Christmas attire.
+          Style: Photorealistic 8k, warm lighting.
+        `;
+      }
 
-      const result = await model.generateContent([
-        ...photoInputs,
-        { text: theme.prompt },
-      ]);
+      // Generate with Gemini
+      const model = this.genAI.getGenerativeModel({ model: modelName });
+
+      // FIX 2: Use 'any' casting or @ts-ignore to bypass strict type check for imageConfig
+      const generationConfig: any = {
+        imageConfig: {
+          aspectRatio: "4:5", // Best for IG/Mobile
+          imageSize: "2K"
+        }
+      };
+
+      const result = await model.generateContent({
+        contents: [
+          ...photoInputs,
+          { role: 'user', parts: [{ text: promptText }] },
+        ],
+        generationConfig: generationConfig, 
+      });
 
       const response = await result.response;
 
@@ -89,13 +140,13 @@ export class GenerationService {
         uploadedImage.secure_url,
       );
 
-      // Update record
+      // Update record with Indonesian Safe URLs
       await this.supabaseService.updateGeneratedPhoto(generationRecord.id, {
         status: 'completed',
-        cloudinary_url_4k: variations.url_4k,
-        cloudinary_url_instagram: variations.url_instagram,
-        cloudinary_url_facebook: variations.url_facebook,
-        cloudinary_url_whatsapp: variations.url_whatsapp,
+        cloudinary_url_4k: this.getIndonesianUrl(variations.url_4k),
+        cloudinary_url_instagram: this.getIndonesianUrl(variations.url_instagram),
+        cloudinary_url_facebook: this.getIndonesianUrl(variations.url_facebook),
+        cloudinary_url_whatsapp: this.getIndonesianUrl(variations.url_whatsapp),
         generation_completed_at: new Date().toISOString(),
       });
 
@@ -119,46 +170,30 @@ export class GenerationService {
       originalUrl,
     );
 
-    // 4K version
-    const image4k = await sharp(imageBuffer)
-      .resize(3000, 4000, { fit: 'cover' })
-      .jpeg({ quality: 95 })
-      .toBuffer();
-
-    // Instagram
-    const imageInstagram = await sharp(imageBuffer)
-      .resize(1080, 1080, { fit: 'cover', position: 'center' })
-      .jpeg({ quality: 90 })
-      .toBuffer();
-
-    // Facebook
-    const imageFacebook = await sharp(imageBuffer)
-      .resize(820, 312, { fit: 'cover', position: 'center' })
-      .jpeg({ quality: 90 })
-      .toBuffer();
-
-    // WhatsApp
-    const imageWhatsapp = await sharp(imageBuffer)
-      .resize(1080, 1920, { fit: 'cover', position: 'center' })
-      .jpeg({ quality: 90 })
-      .toBuffer();
+    // Process images in parallel
+    const [img4k, imgInsta, imgFb, imgWa] = await Promise.all([
+      sharp(imageBuffer).resize(2048, 2560).jpeg({ quality: 90 }).toBuffer(), // 4K/Print
+      sharp(imageBuffer).resize(1080, 1080).jpeg({ quality: 85 }).toBuffer(), // IG Feed
+      sharp(imageBuffer).resize(820, 312).jpeg({ quality: 85 }).toBuffer(),   // FB Cover
+      sharp(imageBuffer).resize(1080, 1920).jpeg({ quality: 85 }).toBuffer()  // WA Story
+    ]);
 
     // Upload all
     const [upload4k, uploadInsta, uploadFb, uploadWa] = await Promise.all([
       this.cloudinaryService.uploadImage(
-        { buffer: image4k } as any,
+        { buffer: img4k } as any,
         'generated/4k',
       ),
       this.cloudinaryService.uploadImage(
-        { buffer: imageInstagram } as any,
+        { buffer: imgInsta } as any,
         'generated/instagram',
       ),
       this.cloudinaryService.uploadImage(
-        { buffer: imageFacebook } as any,
+        { buffer: imgFb } as any,
         'generated/facebook',
       ),
       this.cloudinaryService.uploadImage(
-        { buffer: imageWhatsapp } as any,
+        { buffer: imgWa } as any,
         'generated/whatsapp',
       ),
     ]);
