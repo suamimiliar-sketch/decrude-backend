@@ -19,13 +19,18 @@ export class PaymentService {
     name: string;
     packageTier: 'basic' | 'premium' | 'family';
   }) {
+    // UPDATED PRICING STRATEGY (JAJAN MODEL)
     const prices = {
-      basic: 49000,
-      premium: 79000,
-      family: 99000,
+      basic: 10000,    // Paket Coba
+      premium: 15000,  // Paket Seru
+      family: 20000,   // Paket Puas
     };
 
     const amount = prices[orderData.packageTier];
+
+    if (!amount) {
+      throw new Error("Invalid package tier");
+    }
 
     const order = await this.supabaseService.createOrder({
       email: orderData.email,
